@@ -1,0 +1,116 @@
+{
+  "name": "insurance_platform_daily",
+  "description": "Daily run of Insurance Data Platform — Bronze to Gold + Fraud",
+  "max_concurrent_runs": 1,
+  "schedule": {
+    "quartz_cron_expression": "0 0 6 * * ?",
+    "timezone_id": "Europe/Zurich",
+    "pause_status": "UNPAUSED"
+  },
+  "tags": {
+    "project": "insurance-data-platform",
+    "environment": "production",
+    "owner": "data-engineering"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "insurance_platform_cluster",
+      "new_cluster": {
+        "spark_version": "15.4.x-scala2.12",
+        "node_type_id": "Standard_DS3_v2",
+        "num_workers": 2,
+        "autoscale": {
+          "min_workers": 2,
+          "max_workers": 8
+        },
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "auto"
+        },
+        "custom_tags": {
+          "project": "insurance-data-platform"
+        },
+        "init_scripts": [],
+        "libraries": [
+          { "pypi": { "package": "faker==24.0.0" } },
+          { "pypi": { "package": "pandas==2.2.0" } },
+          { "pypi": { "package": "pyarrow==15.0.0" } }
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "bronze_ingestion",
+      "description": "Raw ingestion with schema enforcement and DQ quarantine",
+      "job_cluster_key": "insurance_platform_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/insurance-data-platform/notebooks/01_bronze_layer",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 2,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "silver_transformations",
+      "description": "Cleanse, type cast, enrich and deduplicate",
+      "depends_on": [
+        { "task_key": "bronze_ingestion" }
+      ],
+      "job_cluster_key": "insurance_platform_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/insurance-data-platform/notebooks/02_silver_layer",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "gold_aggregations",
+      "description": "Business KPI aggregations for BI consumption",
+      "depends_on": [
+        { "task_key": "silver_transformations" }
+      ],
+      "job_cluster_key": "insurance_platform_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/insurance-data-platform/notebooks/03_gold_layer",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "fraud_detection",
+      "description": "Composite fraud scoring and investigation queue",
+      "depends_on": [
+        { "task_key": "silver_transformations" }
+      ],
+      "job_cluster_key": "insurance_platform_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/insurance-data-platform/notebooks/04_fraud_detection",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": false
+    }
+  ],
+  "email_notifications": {
+    "on_failure": ["saravanakumar.oravichandran@gmail.com"],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {},
+  "notification_settings": {
+    "no_alert_for_skipped_runs": true,
+    "no_alert_for_canceled_runs": false
+  }
+}
