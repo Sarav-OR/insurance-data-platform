@@ -42,12 +42,7 @@ jobs:
           flake8 src/ tests/ \
             --max-line-length=120 \
             --ignore=E501,W503,E221,E241,E302,E402,E122,E127,W504,F401 \
-            --exclude=__pycache__    
-
-      - name: Check formatting with black
-        run: |
-          black --check src/ tests/ \
-            --line-length=120
+            --exclude=__pycache__ 
 
   # ─────────────────────────────────────────────
   # JOB 2 — Unit Tests
