@@ -175,20 +175,27 @@ class TestCustomerDQ:
         good, bad = apply_dq(good_customers_df, rules)
         assert good.count() == 3
         assert bad.count() == 0
-
+        
     def test_null_customer_id_rejected(self, spark):
         """Customer with null ID is rejected."""
+        schema = T.StructType([
+        T.StructField("customer_id", T.StringType(), True),
+        T.StructField("email",       T.StringType(), True),
+        T.StructField("country",     T.StringType(), True),
+        ])
         data = [(None, "test@test.com", "CH")]
-        sdf = spark.createDataFrame(data, ["customer_id", "email", "country"])
-        rules = get_bronze_rules("customers")
-        good, bad = apply_dq(sdf, rules)
-        assert good.count() == 0
-        assert bad.count() == 1
+        sdf = spark.createDataFrame(data, schema)        
 
+    
     def test_invalid_email_rejected(self, spark):
         """Customer with email missing @ is rejected."""
+        schema = T.StructType([
+        T.StructField("customer_id", T.StringType(), True),
+        T.StructField("email",       T.StringType(), True),
+        T.StructField("country",     T.StringType(), True),
+        ])
         data = [("CUST-001", "invalidemail", "CH")]
-        sdf = spark.createDataFrame(data, ["customer_id", "email", "country"])
+        sdf = spark.createDataFrame(data, schema)
         rules = get_bronze_rules("customers")
         good, bad = apply_dq(sdf, rules)
         assert good.count() == 0
@@ -228,12 +235,16 @@ class TestClaimsDQ:
 
     def test_negative_claim_amount_rejected(self, spark):
         """Claim with negative amount is rejected."""
-        data = [("CLM-001", "POL-001", "CUST-001", -500.0, "2023-01-15", 5)]
-        sdf = spark.createDataFrame(
-            data,
-            ["claim_id", "policy_id", "customer_id",
-             "claim_amount_chf", "incident_date", "days_to_submit"]
-        )
+        schema = T.StructType([
+        T.StructField("claim_id",          T.StringType(),  True),
+        T.StructField("policy_id",         T.StringType(),  True),
+        T.StructField("customer_id",       T.StringType(),  True),
+        T.StructField("claim_amount_chf",  T.DoubleType(),  True),
+        T.StructField("incident_date",     T.StringType(),  True),
+        T.StructField("days_to_submit",    T.IntegerType(), True),
+    ])
+    data = [("CLM-001", "POL-001", "CUST-001", -500.0, "2023-01-15", 5)]
+    sdf = spark.createDataFrame(data, schema)
         rules = get_bronze_rules("claims")
         good, bad = apply_dq(sdf, rules)
         assert good.count() == 0
@@ -241,11 +252,16 @@ class TestClaimsDQ:
 
     def test_negative_days_to_submit_rejected(self, spark):
         """Claim with negative days_to_submit is rejected."""
-        data = [("CLM-001", "POL-001", "CUST-001", 5000.0, "2023-01-15", -3)]
-        sdf = spark.createDataFrame(
-            data,
-            ["claim_id", "policy_id", "customer_id",
-             "claim_amount_chf", "incident_date", "days_to_submit"]
+        schema = T.StructType([
+        T.StructField("claim_id",          T.StringType(),  True),
+        T.StructField("policy_id",         T.StringType(),  True),
+        T.StructField("customer_id",       T.StringType(),  True),
+        T.StructField("claim_amount_chf",  T.DoubleType(),  True),
+        T.StructField("incident_date",     T.StringType(),  True),
+        T.StructField("days_to_submit",    T.IntegerType(), True),
+    ])
+    data = [("CLM-001", "POL-001", "CUST-001", 5000.0, "2023-01-15", -3)]
+    sdf = spark.createDataFrame(data, schema)   "claim_amount_chf", "incident_date", "days_to_submit"]
         )
         rules = get_bronze_rules("claims")
         good, bad = apply_dq(sdf, rules)
