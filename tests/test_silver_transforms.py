@@ -269,7 +269,7 @@ class TestCustomerSegment:
         )
         return sdf.withColumn(
             "customer_segment",
-            F.when(F.col("is_high_value") == True,         F.lit("PREMIUM"))
+            F.when(F.col("is_high_value") F.lit(True),     F.lit("PREMIUM"))
              .when(F.col("customer_tenure_years") >= 5,    F.lit("LOYAL"))
              .otherwise(F.lit("STANDARD"))
         ).collect()[0]["customer_segment"]
