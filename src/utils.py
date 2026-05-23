@@ -1,226 +1,288 @@
 """
 src/utils.py
 ============
-Shared utility functions for Insurance Data Platform.
-Imported by all notebook layers.
+Shared Utility Functions for Insurance Data Platform
+=====================================================
+Purpose : Reusable functions imported by all notebooks.
+          Defined once here — no copy/paste across notebooks.
+          Bug fix here fixes it everywhere.
+
+Usage   : from src.utils import gen_id, rand_date, audit_cols
+          from src.utils import deduplicate, safe_date
+
+Categories:
+  Data Generation  — gen_id, rand_date, rand_amount, audit_cols
+  PySpark Helpers  — safe_date, safe_timestamp, standardise_string
+  Transformations  — deduplicate
+  Delta Operations — write_delta, apply_delta_settings
 """
+
+import uuid
+import hashlib
+import random
+from datetime import datetime, timedelta, date
+from typing import Optional, List
 
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql import Window
 from pyspark.sql.dataframe import DataFrame
-from datetime import datetime
-from typing import Optional, List, Tuple
-import hashlib
-import uuid
-import logging
 
-log = logging.getLogger("insurance_utils")
+# ─────────────────────────────────────────────────────────
+# DATA GENERATION HELPERS
+# Used by Bronze layer to generate synthetic data.
+# ─────────────────────────────────────────────────────────
 
+def gen_id(prefix: str) -> str:
+    """
+    Generate a unique prefixed identifier.
+    Format: PREFIX-XXXXXXXXXX (10 hex chars uppercase)
+    Example: CLM-A1B2C3D4E5
 
-# ─────────────────────────────────────────────
-# AUDIT FUNCTIONS
-# ─────────────────────────────────────────────
+    Args:
+        prefix: Short identifier prefix e.g. 'CLM', 'POL'
 
-def add_bronze_audit(sdf: DataFrame, domain: str, batch_id: str) -> DataFrame:
-    """Add Bronze layer audit columns."""
-    return sdf \
-        .withColumn("_bronze_batch_id",        F.lit(batch_id)) \
-        .withColumn("_bronze_load_timestamp",  F.current_timestamp()) \
-        .withColumn("_bronze_domain",          F.lit(domain)) \
-        .withColumn("_bronze_file_path",       F.input_file_name())
-
-
-def add_silver_audit(sdf: DataFrame, batch_id: str) -> DataFrame:
-    """Add Silver layer audit columns."""
-    return sdf \
-        .withColumn("_silver_batch_id",        F.lit(batch_id)) \
-        .withColumn("_silver_load_timestamp",  F.current_timestamp()) \
-        .withColumn("_silver_source_layer",    F.lit("bronze"))
+    Returns:
+        Unique string ID
+    """
+    return f"{prefix}-{uuid.uuid4().hex[:10].upper()}"
 
 
-def add_gold_audit(sdf: DataFrame, batch_id: str) -> DataFrame:
-    """Add Gold layer audit columns."""
-    return sdf \
-        .withColumn("_gold_batch_id",          F.lit(batch_id)) \
-        .withColumn("_gold_load_timestamp",    F.current_timestamp()) \
-        .withColumn("_gold_source_layer",      F.lit("silver"))
+def rand_date(start: date, end: date) -> date:
+    """
+    Generate a random date between start and end (inclusive).
+
+    Args:
+        start: Earliest possible date
+        end  : Latest possible date
+
+    Returns:
+        Random date within range
+    """
+    delta = (end - start).days
+    return start + timedelta(days=random.randint(0, delta))
 
 
-def add_fraud_audit(sdf: DataFrame, batch_id: str) -> DataFrame:
-    """Add Fraud layer audit columns."""
-    return sdf \
-        .withColumn("_fraud_batch_id",         F.lit(batch_id)) \
-        .withColumn("_fraud_load_timestamp",   F.current_timestamp())
+def rand_amount(lo: float, hi: float) -> float:
+    """
+    Generate a random monetary amount rounded to 2dp.
+
+    Args:
+        lo: Minimum amount
+        hi: Maximum amount
+
+    Returns:
+        Random float rounded to 2 decimal places
+    """
+    return round(random.uniform(lo, hi), 2)
 
 
-def drop_bronze_audit(sdf: DataFrame) -> DataFrame:
-    """Drop Bronze audit columns before writing to Silver."""
-    cols_to_drop = [
-        "_ingestion_timestamp", "_source_system",
-        "_record_hash", "_batch_id",
-        "_bronze_load_timestamp", "_bronze_batch_id", "_bronze_domain"
-    ]
-    existing = [c for c in cols_to_drop if c in sdf.columns]
-    return sdf.drop(*existing)
+def audit_cols(batch_id: str,
+               source_system: str = "synthetic_generator_v2") -> dict:
+    """
+    Generate standard audit columns for every record.
+    These answer: who sent this, when, is it unchanged?
+
+    _ingestion_timestamp : when source system generated record
+    _source_system       : which system sent it
+    _record_hash         : MD5 fingerprint to detect duplicates
+    _batch_id            : which pipeline run loaded it
+
+    Args:
+        batch_id     : Current pipeline batch ID
+        source_system: Name of source system
+
+    Returns:
+        Dict of audit column key-value pairs
+    """
+    return {
+        "_ingestion_timestamp": datetime.utcnow().isoformat(),
+        "_source_system":       source_system,
+        "_record_hash":         hashlib.md5(
+                                    str(uuid.uuid4()).encode()
+                                ).hexdigest(),
+        "_batch_id":            batch_id,
+    }
 
 
-# ─────────────────────────────────────────────
+def age_band(dob: date) -> str:
+    """
+    Calculate age band string from date of birth.
+    Used for customer segmentation analytics.
+
+    Args:
+        dob: Date of birth
+
+    Returns:
+        Age band string e.g. '25-34', '65+'
+    """
+    age = (date.today() - dob).days // 365
+    if age < 25:   return "18-24"
+    elif age < 35: return "25-34"
+    elif age < 45: return "35-44"
+    elif age < 55: return "45-54"
+    elif age < 65: return "55-64"
+    else:          return "65+"
+
+
+# ─────────────────────────────────────────────────────────
+# PYSPARK TRANSFORMATION HELPERS
+# Reusable column expressions used in Silver layer.
+# ─────────────────────────────────────────────────────────
+
+def safe_date(col_name: str):
+    """
+    Safely cast string column to date type.
+    Unparseable values become NULL instead of raising error.
+    Always use this instead of direct cast() for date columns.
+
+    Args:
+        col_name: Name of string column to cast
+
+    Returns:
+        PySpark Column expression
+    """
+    return F.to_date(F.col(col_name), "yyyy-MM-dd")
+
+
+def safe_timestamp(col_name: str):
+    """
+    Safely cast string column to timestamp type.
+
+    Args:
+        col_name: Name of string column to cast
+
+    Returns:
+        PySpark Column expression
+    """
+    return F.to_timestamp(F.col(col_name))
+
+
+def standardise_string(col_name: str):
+    """
+    Standardise categorical string column.
+    Trims whitespace and converts to uppercase.
+    Ensures 'motor', 'MOTOR', ' Motor ' all become 'MOTOR'.
+
+    Args:
+        col_name: Name of string column to standardise
+
+    Returns:
+        PySpark Column expression
+    """
+    return F.upper(F.trim(F.col(col_name)))
+
+
+# ─────────────────────────────────────────────────────────
 # DEDUPLICATION
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 
-def deduplicate(
-    sdf: DataFrame,
-    id_col: str,
-    order_col: str = "_ingestion_timestamp"
-) -> DataFrame:
+def deduplicate(sdf: DataFrame,
+                id_col: str,
+                order_col: str = "_ingestion_timestamp") -> DataFrame:
     """
-    Deduplicate DataFrame keeping latest record per ID.
-    Uses window function — production-safe for large datasets.
+    Remove duplicate records keeping the latest per ID.
+
+    Why this approach:
+    - Source systems sometimes resend updated records
+    - We keep the most recent version using window function
+    - row_number() = 1 means latest for that ID
+    - Safe for large datasets — no collect() or distinct()
+
+    Args:
+        sdf      : Input Spark DataFrame
+        id_col   : Primary key column name
+        order_col: Timestamp column to order by (latest wins)
+
+    Returns:
+        Deduplicated DataFrame
+
+    Example:
+        # If CLM-001 appears 3 times with different statuses
+        # Only the most recent record is kept
+        deduped = deduplicate(claims_sdf, "claim_id")
     """
-    window = Window.partitionBy(id_col).orderBy(F.col(order_col).desc())
+    window = Window \
+        .partitionBy(id_col) \
+        .orderBy(F.col(order_col).desc())
+
     return sdf \
         .withColumn("_row_num", F.row_number().over(window)) \
         .filter(F.col("_row_num") == 1) \
         .drop("_row_num")
 
 
-# ─────────────────────────────────────────────
-# TYPE CASTING
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# DELTA OPERATIONS
+# ─────────────────────────────────────────────────────────
 
-def safe_date(col_name: str):
-    """Safely cast string to date. Bad values become NULL."""
-    return F.to_date(F.col(col_name), "yyyy-MM-dd")
-
-
-def safe_timestamp(col_name: str):
-    """Safely cast string to timestamp. Bad values become NULL."""
-    return F.to_timestamp(F.col(col_name))
-
-
-def standardise_string(col_name: str):
-    """Trim and uppercase categorical string columns."""
-    return F.upper(F.trim(F.col(col_name)))
-
-
-# ─────────────────────────────────────────────
-# DATA QUALITY
-# ─────────────────────────────────────────────
-
-def apply_dq_rules(
-    sdf: DataFrame,
-    domain: str,
-    rules: List[Tuple[str, str]],
-    batch_id: str
-):
+def write_delta(sdf: DataFrame,
+                database: str,
+                table: str,
+                partition_cols: Optional[List[str]] = None,
+                mode: str = "overwrite") -> int:
     """
-    Apply declarative DQ rules and split into good/rejected.
-    Uses NULL-based concat_ws pattern — avoids empty string collision.
+    Write Spark DataFrame to Delta table.
+    Returns actual row count for post-write validation.
 
     Args:
-        sdf: Input DataFrame
-        domain: Domain name for logging
-        rules: List of (sql_expression, error_code) tuples
-        batch_id: Current batch ID for rejected record tracking
+        sdf           : DataFrame to write
+        database      : Target database name
+        table         : Target table name
+        partition_cols: List of columns to partition by
+        mode          : 'overwrite' or 'append'
 
     Returns:
-        Tuple of (good_sdf, bad_sdf)
+        Row count of written table (for validation)
     """
-    if not rules:
-        return sdf, None
-
-    sdf_tagged = sdf.withColumn(
-        "_dq_errors",
-        F.concat_ws("|", *[
-            F.when(F.expr(f"NOT ({rule})"), F.lit(code))
-             .otherwise(F.lit(None).cast("string"))
-            for rule, code in rules
-        ])
-    )
-
-    good_sdf = sdf_tagged.filter(
-        (F.col("_dq_errors").isNull()) |
-        (F.col("_dq_errors") == "")
-    ).drop("_dq_errors")
-
-    bad_sdf = sdf_tagged.filter(
-        F.col("_dq_errors").isNotNull() &
-        (F.col("_dq_errors") != "")
-    ) \
-    .withColumn("_rejected_at",    F.current_timestamp()) \
-    .withColumn("_rejected_batch", F.lit(batch_id))
-
-    good_count = good_sdf.count()
-    bad_count  = bad_sdf.count()
-    total      = good_count + bad_count
-    pass_rate  = (good_count / total * 100) if total > 0 else 0
-
-    log.info(
-        f"DQ [{domain}] Good: {good_count:,} | "
-        f"Rejected: {bad_count:,} | "
-        f"Pass Rate: {pass_rate:.2f}%"
-    )
-
-    return good_sdf, bad_sdf
-
-
-# ─────────────────────────────────────────────
-# DELTA WRITE
-# ─────────────────────────────────────────────
-
-def write_delta(
-    sdf: DataFrame,
-    db: str,
-    table: str,
-    partition_cols: Optional[List[str]] = None,
-    mode: str = "overwrite"
-) -> int:
-    """
-    Write DataFrame to Delta table.
-    Returns row count for validation.
-    """
-    full_table = f"{db}.{table}"
-    writer = sdf.write.format("delta").mode(mode)
-    if partition_cols:
-        writer = writer.partitionBy(*partition_cols)
-    writer.saveAsTable(full_table)
-
     from pyspark.sql import SparkSession
     spark = SparkSession.getActiveSession()
+
+    full_table = f"{database}.{table}"
+    writer = sdf.write.format("delta").mode(mode)
+
+    if partition_cols:
+        writer = writer.partitionBy(*partition_cols)
+
+    writer.saveAsTable(full_table)
+
+    # Post-write count verifies data landed correctly
     count = spark.table(full_table).count()
-    log.info(f"Written {count:,} rows → {full_table}")
     return count
 
 
-# ─────────────────────────────────────────────
-# VALIDATION
-# ─────────────────────────────────────────────
+def apply_delta_settings(spark, settings: dict) -> None:
+    """
+    Apply Delta Lake configuration settings to Spark session.
+    Call this once at start of each notebook.
 
-def validate_layer(
-    db: str,
-    tables: List[str],
-    batch_id: str,
-    layer_name: str
-):
-    """Print validation report for a layer."""
-    from pyspark.sql import SparkSession
-    spark = SparkSession.getActiveSession()
+    Args:
+        spark   : Active SparkSession
+        settings: Dict of spark.conf key-value pairs
+    """
+    for key, value in settings.items():
+        spark.conf.set(key, value)
 
-    print(f"\n{'='*50}")
-    print(f"{layer_name.upper()} LAYER — VALIDATION REPORT")
-    print(f"{'='*50}")
 
-    total = 0
-    for table in tables:
-        try:
-            count = spark.table(f"{db}.{table}").count()
-            total += count
-            print(f"  {table:<25} {count:>10,} rows ✅")
-        except Exception as e:
-            print(f"  {table:<25} ERROR: {e} ❌")
+def drop_bronze_audit_cols(sdf: DataFrame) -> DataFrame:
+    """
+    Remove Bronze audit columns before writing to Silver.
+    Silver adds its own audit columns — Bronze ones not needed.
 
-    print(f"\n  {'TOTAL':<25} {total:>10,} rows")
-    print(f"  Batch ID: {batch_id}")
-    print(f"{'='*50}")
-    return total
+    Args:
+        sdf: DataFrame with Bronze audit columns
+
+    Returns:
+        DataFrame with Bronze audit columns removed
+    """
+    bronze_audit_cols = [
+        "_ingestion_timestamp",
+        "_source_system",
+        "_record_hash",
+        "_batch_id",
+        "_bronze_load_timestamp",
+        "_bronze_batch_id",
+        "_bronze_domain",
+    ]
+    existing = [c for c in bronze_audit_cols if c in sdf.columns]
+    return sdf.drop(*existing)
