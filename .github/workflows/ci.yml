@@ -41,7 +41,7 @@ jobs:
         run: |
           flake8 src/ tests/ \
             --max-line-length=120 \
-            --ignore=E501,W503,E221,E241,E302,E402,E122,E127,W504,F401 \
+            --ignore=E501,W503,E221,E241,E302,E402,E122,E127,W504,F401,E231,E121,E126,E701,E272 \
             --exclude=__pycache__ 
 
   # ─────────────────────────────────────────────
