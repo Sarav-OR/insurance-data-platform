@@ -134,14 +134,14 @@ jobs:
           assert abs(total - 1.0) < 1e-9, f'Fraud weights sum to {total}'
           print(f'✅ Fraud weights valid: {FRAUD_WEIGHTS}')
           "
-
+          
       - name: Validate DQ rules structure
         run: |
           python -c "
-          from src.dq_rules import BRONZE_DQ_RULES
+          from src.dq_rules import BRONZE_RULES
           domains = ['customers', 'policies', 'claims', 'premiums', 'fraud_signals']
           for domain in domains:
-              rules = BRONZE_DQ_RULES.get(domain, [])
+              rules = BRONZE_RULES.get(domain, [])
               assert len(rules) > 0, f'No rules for {domain}'
               for rule, code in rules:
                   assert code.startswith('ERR_'), f'Bad code: {code}'

@@ -225,6 +225,24 @@ def list_all_rules() -> None:
             for rule, code in rules:
                 print(f"    [{code}]")
                 print(f"      Condition: {rule}")
+                
+                
+# ─────────────────────────────────────────────────────────
+# BACKWARD COMPATIBILITY ALIASES
+# Tests and CI reference these names — keep them working
+# ─────────────────────────────────────────────────────────
+
+# Old name → new name mapping
+BRONZE_DQ_RULES = BRONZE_RULES
+SILVER_DQ_RULES = SILVER_RULES
+
+def get_bronze_rules(domain: str) -> list:
+    """Alias for get_rules('bronze', domain)."""
+    return get_rules("bronze", domain)
+
+def get_silver_rules(domain: str) -> list:
+    """Alias for get_rules('silver', domain)."""
+    return get_rules("silver", domain)                
 
 
 if __name__ == "__main__":
