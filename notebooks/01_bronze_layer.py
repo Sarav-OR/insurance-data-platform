@@ -1,3 +1,4 @@
+# Databricks notebook source
 """
 notebooks/01_bronze_layer.py
 =============================
@@ -27,6 +28,10 @@ Pipeline flow per domain:
     → Volume check  → alert if anomaly
 """
 
+
+# COMMAND ----------
+
+
 # ═══════════════════════════════════════════════════════════
 # CELL 1 — Repository Path Setup
 # Purpose : Add repo root to Python path so src/ imports work.
@@ -39,11 +44,15 @@ import os
 
 # Add repo root to path — enables: from src.config import CONFIG
 # Update YOUR_USERNAME to your Databricks workspace username
-REPO_ROOT = "/Workspace/Repos/YOUR_USERNAME/insurance-data-platform"
+REPO_ROOT = "/Workspace/Repos/saravanakumar.or@live.com/insurance-data-platform"
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 print(f"✅ Repo root added to path: {REPO_ROOT}")
+
+# COMMAND ----------
+
+
 
 # ═══════════════════════════════════════════════════════════
 # CELL 2 — Imports
@@ -103,6 +112,10 @@ print(f"✅ All imports successful")
 print(f"   Batch ID : {BATCH_ID}")
 print(f"   Database : {BRONZE_DB}")
 
+
+# COMMAND ----------
+
+
 # ═══════════════════════════════════════════════════════════
 # CELL 3 — Seeding and Database Setup
 # Purpose : Fix random seed for reproducible data generation.
@@ -129,6 +142,10 @@ apply_delta_settings(spark, DELTA_SETTINGS)
 print(f"✅ Database '{BRONZE_DB}' ready")
 print(f"✅ Seed set to {GENERATION['seed']}")
 print(f"✅ Delta optimisations applied")
+
+# COMMAND ----------
+
+
 
 # ═══════════════════════════════════════════════════════════
 # CELL 4 — Domain Ingestion Orchestrator
@@ -255,6 +272,10 @@ def _write_quarantine(bad_sdf, domain: str, good_sdf) -> int:
 
 print("✅ Ingestion orchestrator ready")
 
+# COMMAND ----------
+
+
+
 # ═══════════════════════════════════════════════════════════
 # CELL 5 — Generate and Ingest: Customers
 # Purpose : Generate synthetic customer records and ingest
@@ -300,6 +321,9 @@ customers_pdf = pd.DataFrame(customers)
 customer_ids  = [c["customer_id"] for c in customers]
 
 customers_count = ingest_domain(customers_pdf, "customers")
+
+# COMMAND ----------
+
 
 # ═══════════════════════════════════════════════════════════
 # CELL 6 — Generate and Ingest: Policies
@@ -350,6 +374,10 @@ policies_pdf = pd.DataFrame(policies)
 policy_ids   = [p["policy_id"] for p in policies]
 
 policies_count = ingest_domain(policies_pdf, "policies")
+
+# COMMAND ----------
+
+
 
 # ═══════════════════════════════════════════════════════════
 # CELL 7 — Generate and Ingest: Claims
@@ -416,6 +444,10 @@ log.info(
 claims_pdf   = pd.DataFrame(claims)
 claims_count = ingest_domain(claims_pdf, "claims")
 
+# COMMAND ----------
+
+
+
 # ═══════════════════════════════════════════════════════════
 # CELL 8 — Generate and Ingest: Premiums
 # Purpose : Generate synthetic premium payment records.
@@ -463,6 +495,10 @@ for _ in range(GENERATION["num_premiums"]):
 premiums_pdf   = pd.DataFrame(premiums)
 premiums_count = ingest_domain(premiums_pdf, "premiums")
 
+# COMMAND ----------
+
+
+
 # ═══════════════════════════════════════════════════════════
 # CELL 9 — Generate and Ingest: Fraud Signals
 # Purpose : Derive fraud signal records from flagged claims.
@@ -507,6 +543,10 @@ log.info(f"Fraud signals generated: {len(signals):,}")
 
 signals_pdf   = pd.DataFrame(signals)
 signals_count = ingest_domain(signals_pdf, "fraud_signals")
+
+# COMMAND ----------
+
+
 
 # ═══════════════════════════════════════════════════════════
 # CELL 10 — Validation Report
@@ -592,6 +632,10 @@ if error_count > 0:
         f"Review pipeline_errors table before proceeding."
     )
 
+
+# COMMAND ----------
+
+
 # ═══════════════════════════════════════════════════════════
 # CELL 11 — Sample Data Spot Checks
 # Purpose : Visual verification that data looks realistic.
@@ -638,3 +682,19 @@ spark.sql(f"""
 """).show()
 
 print(f"\n✅ Bronze layer complete — Batch ID: {BATCH_ID}")
+
+
+# COMMAND ----------
+
+# Run in a new cell
+spark.sql("""
+    SELECT domain, good_count, bad_count,
+           pass_rate_pct, load_timestamp
+    FROM insurance_bronze.dq_monitoring
+    ORDER BY domain
+""").show()
+
+spark.sql("""
+    SELECT COUNT(*) AS total_errors
+    FROM insurance_bronze.pipeline_errors
+""").show()

@@ -239,7 +239,9 @@ def write_delta(sdf: DataFrame,
     spark = SparkSession.getActiveSession()
 
     full_table = f"{database}.{table}"
-    writer = sdf.write.format("delta").mode(mode)
+    writer = sdf.write.format("delta").mode(mode) \
+             .option("overwriteSchema", "true")
+             
 
     if partition_cols:
         writer = writer.partitionBy(*partition_cols)

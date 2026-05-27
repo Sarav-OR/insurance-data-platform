@@ -1,642 +1,811 @@
 # Databricks notebook source
 """
-04_fraud_detection.py
-=====================
-Production-grade Fraud Detection Layer for Insurance Data Platform.
+notebooks/04_fraud_detection.py
+================================
+Fraud Detection Layer — Insurance Data Platform
+================================================
+Purpose : Build a multi-signal composite fraud scoring engine
+          on top of Silver claims data.
+Layer   : Fraud (Analytical)
+Reads   : insurance_silver.claims
+          insurance_silver.policies
+          insurance_silver.customers
+          insurance_silver.fraud_signals
+Writes  : insurance_fraud.* Delta tables
 
-Approaches:
-1. Rule-based detection    — known fraud patterns
-2. Statistical scoring     — Z-score anomaly detection
-3. Behavioural flags       — customer claim frequency patterns
-4. Network signals         — multi-claim customer detection
-5. Composite scoring       — weighted combination of all signals
-6. Investigation queue     — prioritised list for fraud investigators
+Depends on:
+  src/config.py     — FRAUD_WEIGHTS, FRAUD_THRESHOLDS, BATCH_ID
+  src/utils.py      — write_delta, apply_delta_settings
+  src/audit.py      — add_fraud_audit
+  src/monitoring.py — log_pipeline_error
 
-Architecture:
-    Silver Delta → Fraud Engine → Fraud Delta Tables
+Fraud scoring architecture:
+  Four independent signals → Composite weighted score → Risk tier
 
-NOTE: All boolean expressions use PySpark operators:
-      & for AND, | for OR, ~ for NOT
-      Never use Python's and/or/not with Spark columns.
+  Signal 1: Rule-based scoring
+    Known fraud patterns — late submission, high amounts,
+    third party involvement, policy inception timing
+
+  Signal 2: Statistical anomaly detection
+    Z-score analysis on claim amounts per policy type
+    Claims beyond 2 standard deviations flagged as anomalous
+
+  Signal 3: Behavioural analysis
+    Customer claim velocity — how many claims in lifetime
+    Prior fraud history — previous fraud flags on record
+    Submission patterns — consistently late submissions
+
+  Signal 4: Network scoring
+    Duplicate detection — same customer, multiple policies
+    Claims clustering — multiple claims in short window
+
+  Composite score:
+    Weighted combination of all 4 signals (weights sum to 1.0)
+    CRITICAL: score >= 0.75
+    HIGH:     score >= 0.50
+    MEDIUM:   score >= 0.25
+    LOW:      score <  0.25
+
+  Investigation queue:
+    Priority-ordered list for fraud analysts
+    CRITICAL claims investigated first
 """
 
-# ─────────────────────────────────────────────
-# CELL 1 — Imports & Configuration
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# CELL 1 — Repository Path Setup
+# Purpose : Add repo root to Python path so src/ imports work.
+#           Must be first cell. Update with your username.
+# ═══════════════════════════════════════════════════════════
+
+import sys
+import os
+
+REPO_ROOT = "/Workspace/Repos/saravanakumar.or@live.com/insurance-data-platform"
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+print(f"✅ Repo root added to path: {REPO_ROOT}")
+
+# COMMAND ----------
+
+
+
+# ═══════════════════════════════════════════════════════════
+# CELL 2 — Imports
+# Purpose : Import all required libraries and src/ modules.
+#           Fraud layer needs statistical functions and
+#           window operations for velocity detection.
+# ═══════════════════════════════════════════════════════════
+
+import logging
+from datetime import datetime
 
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql import Window
-from datetime import datetime
-import logging
 
+from src.config     import (BATCH_ID, DATABASES,
+                             DELTA_SETTINGS, FRAUD_WEIGHTS,
+                             FRAUD_THRESHOLDS)
+from src.utils      import (write_delta, apply_delta_settings)
+from src.audit      import add_fraud_audit
+from src.monitoring import log_pipeline_error
+
+# ── Logging ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("insurance_fraud")
+log = logging.getLogger("fraud_detection")
 
-SILVER_DB  = "insurance_silver"
-FRAUD_DB   = "insurance_fraud"
-BATCH_ID   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+# ── Convenience aliases ───────────────────────────────────
+SILVER_DB = DATABASES["silver"]
+FRAUD_DB  = DATABASES["fraud"]
 
-WEIGHTS = {
-    "rule_score":        0.35,
-    "statistical_score": 0.25,
-    "behavioural_score": 0.25,
-    "network_score":     0.15,
-}
+# ── Fraud scoring weights from config ────────────────────
+# Weights defined in src/config.py — change there not here
+# Must sum to 1.0 — validated at import time in config.py
+WEIGHTS = FRAUD_WEIGHTS
+log.info(f"Fraud weights: {WEIGHTS}")
 
-print(f"Fraud detection starting — Batch ID: {BATCH_ID}")
+print(f"✅ All imports successful")
+print(f"   Batch ID  : {BATCH_ID}")
+print(f"   Source DB : {SILVER_DB}")
+print(f"   Target DB : {FRAUD_DB}")
+print(f"   Weights   : {WEIGHTS}")
+
 
 # COMMAND ----------
 
 
-
-# ─────────────────────────────────────────────
-# CELL 2 — Setup Fraud Database
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# CELL 3 — Database Setup and Silver Validation
+# Purpose : Create Fraud database and validate all required
+#           Silver tables exist before scoring begins.
+# ═══════════════════════════════════════════════════════════
 
 spark.sql(f"DROP DATABASE IF EXISTS {FRAUD_DB} CASCADE")
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {FRAUD_DB}")
 spark.sql(f"USE {FRAUD_DB}")
-print(f"✅ Database '{FRAUD_DB}' ready")
+apply_delta_settings(spark, DELTA_SETTINGS)
+
+# Validate Silver tables exist
+print("\nValidating Silver tables exist...")
+required_silver = [
+    "claims", "policies", "customers", "fraud_signals"
+]
+for table in required_silver:
+    try:
+        count = spark.table(f"{SILVER_DB}.{table}").count()
+        print(f"  {SILVER_DB}.{table:<20} {count:>8,} rows ✅")
+    except Exception as e:
+        raise RuntimeError(
+            f"Silver table '{table}' not found. "
+            f"Run Silver notebook first."
+        )
+
+print(f"\n✅ Database '{FRAUD_DB}' ready")
 
 # COMMAND ----------
 
 
 
-# ─────────────────────────────────────────────
-# CELL 3 — Utility Functions
-# ─────────────────────────────────────────────
-
-def add_fraud_audit(sdf):
-    return sdf \
-        .withColumn("_fraud_batch_id",       F.lit(BATCH_ID)) \
-        .withColumn("_fraud_load_timestamp", F.current_timestamp()) \
-        .withColumn("_fraud_source_layer",   F.lit("silver"))
-
-
-def write_fraud(sdf, table: str, partition_cols: list = None):
-    full_table = f"{FRAUD_DB}.{table}"
-    writer = sdf.write.format("delta").mode("overwrite")
-    if partition_cols:
-        writer = writer.partitionBy(*partition_cols)
-    writer.saveAsTable(full_table)
-    count = spark.table(full_table).count()
-    log.info(f"  ✅ {full_table} → {count:,} rows")
-    return count
-
-
-print("✅ Utility functions defined")
-
-
-# COMMAND ----------
-
-
-
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
 # CELL 4 — Load Silver Tables
-# ─────────────────────────────────────────────
-
-print("\nLoading Silver tables...")
+# Purpose : Load all required Silver tables into memory.
+#           Loading once here avoids repeated table reads
+#           across multiple scoring cells.
+# ═══════════════════════════════════════════════════════════
 
 silver_claims    = spark.table(f"{SILVER_DB}.claims")
 silver_policies  = spark.table(f"{SILVER_DB}.policies")
 silver_customers = spark.table(f"{SILVER_DB}.customers")
-silver_enriched  = spark.table(f"{SILVER_DB}.claims_enriched")
+silver_fraud     = spark.table(f"{SILVER_DB}.fraud_signals")
 
-print(f"  Claims:    {silver_claims.count():,}")
-print(f"  Policies:  {silver_policies.count():,}")
-print(f"  Customers: {silver_customers.count():,}")
-print("✅ Silver tables loaded")
+# Cache claims — used by multiple scoring signals
+# Caching avoids repeated Delta reads for the same data
+silver_claims.cache()
 
+print(f"✅ Silver tables loaded")
+print(f"   claims:    {silver_claims.count():,}")
+print(f"   policies:  {silver_policies.count():,}")
+print(f"   customers: {silver_customers.count():,}")
+print(f"   signals:   {silver_fraud.count():,}")
+
+# ═══════════════════════════════════════════════════════════
+# CELL 5 — Fraud Orchestrator
+# Purpose : Reusable function for writing Fraud tables.
+#           Adds audit columns and handles errors consistently.
+# ═══════════════════════════════════════════════════════════
+
+def build_fraud_table(sdf,
+                      table_name: str,
+                      partition_cols: list = None) -> int:
+    """
+    Write fraud scoring DataFrame to Fraud Delta table.
+    Adds audit columns and handles errors consistently.
+
+    Args:
+        sdf           : Fraud scoring DataFrame
+        table_name    : Target table name
+        partition_cols: Optional partition columns
+
+    Returns:
+        Row count written
+    """
+    print(f"\n{'─'*50}")
+    print(f"  BUILDING: {table_name.upper()}")
+    print(f"{'─'*50}")
+
+    try:
+        sdf   = add_fraud_audit(sdf, BATCH_ID)
+        count = write_delta(
+            sdf, FRAUD_DB, table_name, partition_cols
+        )
+        print(f"  ✅ Complete: {count:,} rows")
+        return count
+
+    except Exception as e:
+        log.error(f"[{table_name}] FAILED: {str(e)}")
+        log_pipeline_error(spark, table_name, e, BATCH_ID)
+        raise
+
+
+print("✅ Fraud orchestrator ready")
 
 # COMMAND ----------
 
 
-# ─────────────────────────────────────────────
-# CELL 5 — Rule-Based Detection
-# ─────────────────────────────────────────────
 
-print(f"\n{'='*50}")
-print("RUNNING: RULE-BASED DETECTION")
-print(f"{'='*50}")
+# ═══════════════════════════════════════════════════════════
+# CELL 6 — Signal 1: Rule-Based Scoring
+# Purpose : Score each claim against known fraud patterns.
+#           Rules are based on insurance industry experience.
+#           Each rule that fires adds to the rule score.
+#
+# Rules applied:
+#   late_submission     — submitted > 45 days after incident
+#   high_amount         — claim > 100,000 CHF
+#   third_party         — third party involved (common in fraud)
+#   already_suspected   — already flagged in Bronze
+#   catastrophic        — severity = CATASTROPHIC
+#   very_delayed        — submission_delay_band = VERY_DELAYED
+#   no_police_report    — high amount but no police report
+#
+# Scoring:
+#   Each fired rule contributes equally to rule_score
+#   rule_score = rules_fired / total_rules (0.0 to 1.0)
+# ═══════════════════════════════════════════════════════════
 
-HIGH_CLAIM_THRESHOLD  = 75_000.0
-VERY_HIGH_CLAIM       = 100_000.0
-LATE_SUBMISSION_DAYS  = 45
-VERY_LATE_SUBMISSION  = 55
+try:
+    RULE_DEFINITIONS = [
+        # (rule_name, condition_expression, weight)
+        ("late_submission",
+         "days_to_submit > 45",
+         0.15),
+        ("high_amount",
+         "claim_amount_chf > 100000",
+         0.20),
+        ("third_party_involved",
+         "third_party_involved = true",
+         0.10),
+        ("already_fraud_suspected",
+         "is_fraud_suspected = true",
+         0.25),
+        ("catastrophic_severity",
+         "claim_severity = 'CATASTROPHIC'",
+         0.15),
+        ("very_delayed_submission",
+         "submission_delay_band = 'VERY_DELAYED'",
+         0.10),
+        ("high_amount_no_police",
+         "claim_amount_chf > 50000 AND police_report_filed = false",
+         0.05),
+    ]
 
-rule_based = silver_claims \
-    .join(
-        silver_policies.select(
-            "policy_id", "coverage_amount_chf",
-            "deductible_chf", "start_date", "risk_score"
-        ),
-        on="policy_id",
-        how="left"
-    ) \
-    .withColumn("rule_high_claim_amount",
-                F.when(F.col("claim_amount_chf") > F.lit(HIGH_CLAIM_THRESHOLD),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_claim_exceeds_coverage",
-                F.when(F.col("claim_amount_chf") > F.col("coverage_amount_chf"),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_late_submission",
-                F.when(F.col("days_to_submit") > F.lit(LATE_SUBMISSION_DAYS),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_third_party_high_value",
-                F.when(
-                    (F.col("third_party_involved") == True) &
-                    (F.col("claim_amount_chf") > F.lit(HIGH_CLAIM_THRESHOLD)),
-                    F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_no_police_report_high_value",
-                F.when(
-                    (F.col("police_report_filed") == False) &
-                    (F.col("claim_amount_chf") > F.lit(HIGH_CLAIM_THRESHOLD)),
-                    F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_high_risk_policy",
-                F.when(F.col("risk_score") > F.lit(0.8),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_very_late_submission",
-                F.when(F.col("days_to_submit") > F.lit(VERY_LATE_SUBMISSION),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rule_very_high_claim",
-                F.when(F.col("claim_amount_chf") > F.lit(VERY_HIGH_CLAIM),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("rules_fired_count",
-                F.col("rule_high_claim_amount") +
-                F.col("rule_claim_exceeds_coverage") +
-                F.col("rule_late_submission") +
-                F.col("rule_third_party_high_value") +
-                F.col("rule_no_police_report_high_value") +
-                F.col("rule_high_risk_policy") +
-                F.col("rule_very_late_submission") +
-                F.col("rule_very_high_claim")) \
-    .withColumn("rule_score",
-                F.least(F.lit(1.0),
-                        F.greatest(F.lit(0.0),
-                                   F.col("rules_fired_count") / F.lit(8.0)))) \
-    .select(
+    # Apply each rule and calculate weighted score
+    rule_sdf = silver_claims.select(
         "claim_id", "policy_id", "customer_id",
         "claim_amount_chf", "days_to_submit",
-        "rule_high_claim_amount",
-        "rule_claim_exceeds_coverage",
-        "rule_late_submission",
-        "rule_third_party_high_value",
-        "rule_no_police_report_high_value",
-        "rule_high_risk_policy",
-        "rule_very_late_submission",
-        "rule_very_high_claim",
-        "rules_fired_count",
-        F.round("rule_score", 3).alias("rule_score")
+        "is_fraud_suspected", "third_party_involved",
+        "police_report_filed", "claim_severity",
+        "submission_delay_band"
     )
 
-rule_based = add_fraud_audit(rule_based)
-write_fraud(rule_based, "fraud_rule_hits")
+    # Add binary flag for each rule (1 = fired, 0 = not fired)
+    for rule_name, condition, _ in RULE_DEFINITIONS:
+        rule_sdf = rule_sdf.withColumn(
+            f"rule_{rule_name}",
+            F.when(F.expr(condition), F.lit(1))
+             .otherwise(F.lit(0))
+        )
 
-print("\nRule hit distribution:")
-spark.sql("""
-    SELECT rules_fired_count,
-           COUNT(*)                    AS claim_count,
-           ROUND(AVG(rule_score), 3)   AS avg_rule_score
-    FROM insurance_fraud.fraud_rule_hits
-    GROUP BY rules_fired_count
-    ORDER BY rules_fired_count DESC
-""").show()
+    # Calculate weighted rule score
+    # Each rule has a weight — weighted sum = rule_score
+    total_weight = sum(w for _, _, w in RULE_DEFINITIONS)
+    score_expr   = sum(
+        F.col(f"rule_{name}") * F.lit(weight)
+        for name, _, weight in RULE_DEFINITIONS
+    ) / F.lit(total_weight)
 
+    rule_cols   = [f"rule_{name}" for name, _, _ in RULE_DEFINITIONS]
+    rules_fired = sum(F.col(c) for c in rule_cols)
+
+    rule_sdf = rule_sdf \
+        .withColumn("rule_score",
+                    F.round(score_expr, 4)) \
+        .withColumn("rules_fired_count",
+                    rules_fired) \
+        .select(
+            "claim_id", "rule_score",
+            "rules_fired_count", *rule_cols
+        )
+
+    build_fraud_table(rule_sdf, "fraud_rule_hits")
+
+except Exception as e:
+    log.error(f"Rule scoring FAILED: {str(e)}")
+    log_pipeline_error(spark, "fraud_rule_hits", e, BATCH_ID)
+    raise
 
 # COMMAND ----------
 
 
-# ─────────────────────────────────────────────
-# CELL 6 — Statistical Anomaly Scoring
-# ─────────────────────────────────────────────
 
-print(f"\n{'='*50}")
-print("RUNNING: STATISTICAL ANOMALY SCORING")
-print(f"{'='*50}")
+# ═══════════════════════════════════════════════════════════
+# CELL 7 — Signal 2: Statistical Anomaly Detection
+# Purpose : Detect claims with statistically unusual amounts
+#           using Z-score analysis per policy type.
+#
+# How Z-score works:
+#   Z = (value - mean) / standard_deviation
+#   Z > 2.0 means value is 2 standard deviations above mean
+#   Z > 2.0 flags as statistical anomaly
+#
+# Why per policy type:
+#   A 50,000 CHF claim is normal for commercial insurance
+#   but highly unusual for travel insurance.
+#   Grouping by policy_type makes comparison fair.
+#
+# Output:
+#   z_score_amount       — Z-score of claim amount
+#   is_statistical_anomaly — Z > threshold (default 2.0)
+#   statistical_score    — normalised 0-1 score
+# ═══════════════════════════════════════════════════════════
 
-window_claim_type = Window.partitionBy("claim_type")
+try:
+    # Join claims to policies to get policy_type for grouping
+    claims_with_type = silver_claims \
+        .join(
+            silver_policies.select("policy_id", "policy_type"),
+            on="policy_id", how="left"
+        )
 
-statistical_scores = silver_claims \
-    .withColumn("mean_amount_by_type",
-                F.avg("claim_amount_chf").over(window_claim_type)) \
-    .withColumn("stddev_amount_by_type",
-                F.stddev("claim_amount_chf").over(window_claim_type)) \
-    .withColumn("z_score_amount",
-                F.when(
-                    F.col("stddev_amount_by_type") > F.lit(0.0),
-                    F.abs(
-                        (F.col("claim_amount_chf") - F.col("mean_amount_by_type")) /
-                        F.col("stddev_amount_by_type")
-                    )
-                ).otherwise(F.lit(0.0))) \
-    .withColumn("mean_days_by_type",
-                F.avg("days_to_submit").over(window_claim_type)) \
-    .withColumn("stddev_days_by_type",
-                F.stddev("days_to_submit").over(window_claim_type)) \
-    .withColumn("z_score_days",
-                F.when(
-                    F.col("stddev_days_by_type") > F.lit(0.0),
-                    F.abs(
-                        (F.col("days_to_submit") - F.col("mean_days_by_type")) /
-                        F.col("stddev_days_by_type")
-                    )
-                ).otherwise(F.lit(0.0))) \
-    .withColumn("combined_z_score",
-                (F.col("z_score_amount") * F.lit(0.7)) +
-                (F.col("z_score_days")   * F.lit(0.3))) \
-    .withColumn("statistical_score",
-                F.least(F.lit(1.0),
-                        F.greatest(F.lit(0.0),
-                                   F.lit(1.0) - (F.lit(1.0) /
-                                   (F.lit(1.0) + F.col("combined_z_score")))))) \
-    .withColumn("is_statistical_anomaly",
-                F.when(F.col("z_score_amount") > F.lit(2.0),
-                       F.lit(True)).otherwise(F.lit(False))) \
-    .select(
-        "claim_id", "claim_type",
-        "claim_amount_chf",
-        F.round("mean_amount_by_type",   2).alias("mean_amount_by_type"),
-        F.round("stddev_amount_by_type", 2).alias("stddev_amount_by_type"),
-        F.round("z_score_amount",        3).alias("z_score_amount"),
-        F.round("z_score_days",          3).alias("z_score_days"),
-        F.round("combined_z_score",      3).alias("combined_z_score"),
-        F.round("statistical_score",     3).alias("statistical_score"),
-        "is_statistical_anomaly"
+    # Calculate mean and std per policy type
+    # Window function — no groupBy needed, preserves all rows
+    policy_window = Window.partitionBy("policy_type")
+
+    stat_sdf = claims_with_type \
+        .withColumn("mean_amount",
+                    F.avg("claim_amount_chf")
+                     .over(policy_window)) \
+        .withColumn("std_amount",
+                    F.stddev("claim_amount_chf")
+                     .over(policy_window)) \
+        .withColumn("z_score_amount",
+                    F.when(
+                        F.col("std_amount") > 0,
+                        F.round(
+                            (F.col("claim_amount_chf") -
+                             F.col("mean_amount")) /
+                            F.col("std_amount"),
+                            3
+                        )
+                    ).otherwise(F.lit(0.0))) \
+        .withColumn("is_statistical_anomaly",
+                    F.when(
+                        F.col("z_score_amount") >
+                        F.lit(FRAUD_THRESHOLDS["z_score_anomaly"]),
+                        F.lit(True)
+                    ).otherwise(F.lit(False))) \
+        .withColumn("statistical_score",
+                    F.round(
+                        F.when(
+                            F.col("z_score_amount") > 0,
+                            F.least(
+                                F.col("z_score_amount") /
+                                F.lit(5.0),
+                                F.lit(1.0)
+                            )
+                        ).otherwise(F.lit(0.0)),
+                        4
+                    )) \
+        .select(
+            "claim_id", "policy_type",
+            "claim_amount_chf", "mean_amount",
+            "std_amount", "z_score_amount",
+            "is_statistical_anomaly", "statistical_score"
+        )
+
+    build_fraud_table(
+        stat_sdf, "fraud_statistical_scores"
     )
 
-statistical_scores = add_fraud_audit(statistical_scores)
-write_fraud(statistical_scores, "fraud_statistical_scores")
+except Exception as e:
+    log.error(f"Statistical scoring FAILED: {str(e)}")
+    log_pipeline_error(
+        spark, "fraud_statistical_scores", e, BATCH_ID
+    )
+    raise
 
-print("\nStatistical anomaly summary:")
-spark.sql("""
-    SELECT claim_type,
-           COUNT(*)                            AS total_claims,
-           SUM(CASE WHEN is_statistical_anomaly
-                    THEN 1 ELSE 0 END)         AS anomalies_detected,
-           ROUND(AVG(z_score_amount), 3)       AS avg_z_score,
-           ROUND(AVG(statistical_score), 3)    AS avg_stat_score
-    FROM insurance_fraud.fraud_statistical_scores
-    GROUP BY claim_type
-    ORDER BY anomalies_detected DESC
-""").show()
+# COMMAND ----------
+
+
+
+# ═══════════════════════════════════════════════════════════
+# CELL 8 — Signal 3: Behavioural Analysis
+# Purpose : Analyse customer claim behaviour patterns.
+#           Frequent claimants are higher fraud risk.
+#
+# Behavioural signals:
+#   lifetime_claim_count — total claims ever by this customer
+#   prior_fraud_flags    — how many previous fraud suspicions
+#   avg_days_to_submit   — consistently late = suspicious
+#   high_value_claim_count — how many large claims
+#
+# Scoring:
+#   behavioural_score derived from combination of signals
+#   Normalised to 0-1 range
+# ═══════════════════════════════════════════════════════════
+
+try:
+    # Customer-level claim statistics
+    customer_stats = silver_claims \
+        .groupBy("customer_id") \
+        .agg(
+            F.count("claim_id")
+                .alias("lifetime_claim_count"),
+            F.sum(F.when(
+                F.col("is_fraud_suspected") == F.lit(True),
+                F.lit(1)
+            ).otherwise(F.lit(0)))
+                .alias("prior_fraud_flags"),
+            F.round(F.avg("days_to_submit"), 1)
+                .alias("avg_days_to_submit"),
+            F.sum(F.when(
+                F.col("is_high_value_claim") == F.lit(True),
+                F.lit(1)
+            ).otherwise(F.lit(0)))
+                .alias("high_value_claim_count"),
+            F.round(F.avg("claim_amount_chf"), 2)
+                .alias("avg_claim_amount_chf"),
+        )
+
+    # Join back to claims — one row per claim
+    behav_sdf = silver_claims \
+        .select(
+            "claim_id", "customer_id",
+            "claim_amount_chf", "days_to_submit"
+        ) \
+        .join(customer_stats, on="customer_id", how="left") \
+        .withColumn("behavioural_flags_count",
+                    (F.when(
+                        F.col("lifetime_claim_count") >=
+                        F.lit(FRAUD_THRESHOLDS[
+                            "max_claims_per_window"
+                        ]),
+                        F.lit(1)
+                    ).otherwise(F.lit(0))) +
+                    (F.when(
+                        F.col("prior_fraud_flags") > 0,
+                        F.lit(1)
+                    ).otherwise(F.lit(0))) +
+                    (F.when(
+                        F.col("avg_days_to_submit") > 30,
+                        F.lit(1)
+                    ).otherwise(F.lit(0))) +
+                    (F.when(
+                        F.col("high_value_claim_count") > 1,
+                        F.lit(1)
+                    ).otherwise(F.lit(0)))) \
+        .withColumn("behavioural_score",
+                    F.round(
+                        F.least(
+                            F.col("behavioural_flags_count") /
+                            F.lit(4.0),
+                            F.lit(1.0)
+                        ),
+                        4
+                    )) \
+        .select(
+            "claim_id",
+            "lifetime_claim_count",
+            "prior_fraud_flags",
+            "avg_days_to_submit",
+            "high_value_claim_count",
+            "behavioural_flags_count",
+            "behavioural_score",
+        )
+
+    build_fraud_table(behav_sdf, "fraud_behavioural_flags")
+
+except Exception as e:
+    log.error(f"Behavioural scoring FAILED: {str(e)}")
+    log_pipeline_error(
+        spark, "fraud_behavioural_flags", e, BATCH_ID
+    )
+    raise
 
 
 # COMMAND ----------
 
 
-# ─────────────────────────────────────────────
-# CELL 7 — Behavioural Flag Scoring
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# CELL 9 — Signal 4: Network Scoring
+# Purpose : Detect suspicious patterns across the claim network.
+#           Fraudsters often make multiple claims in short windows
+#           or use the same details across different policies.
+#
+# Network signals:
+#   claims_in_30d_window — claims by same customer in 30 days
+#   policies_with_claims — how many policies have claims
+#   network_flags_count  — total network red flags
+#
+# Scoring:
+#   network_score normalised to 0-1
+# ═══════════════════════════════════════════════════════════
 
-print(f"\n{'='*50}")
-print("RUNNING: BEHAVIOURAL FLAG SCORING")
-print(f"{'='*50}")
+try:
+    # Claims in rolling 30-day window per customer
+    # Window ordered by incident date
+    date_window = Window \
+        .partitionBy("customer_id") \
+        .orderBy(F.col("incident_date").cast("long")) \
+        .rangeBetween(
+            -FRAUD_THRESHOLDS["velocity_window_days"] * 86400,
+            0
+        )
 
-customer_claim_stats = silver_claims \
-    .groupBy("customer_id") \
-    .agg(
-        F.count("claim_id")                 .alias("lifetime_claim_count"),
-        F.sum("claim_amount_chf")           .alias("lifetime_claimed_chf"),
-        F.avg("claim_amount_chf")           .alias("avg_claim_amount"),
-        F.min("incident_date")              .alias("first_claim_date"),
-        F.max("incident_date")              .alias("last_claim_date"),
-        F.countDistinct("policy_id")        .alias("policies_claimed_on"),
-        F.countDistinct("claim_type")       .alias("claim_type_diversity"),
-        F.sum(F.when(F.col("is_fraud_suspected") == True,
-                     F.lit(1)).otherwise(F.lit(0))).alias("prior_fraud_flags"),
-    ) \
-    .withColumn("claim_span_days",
-                F.datediff(F.col("last_claim_date"), F.col("first_claim_date"))) \
-    .withColumn("flag_high_frequency",
-                F.when(F.col("lifetime_claim_count") > F.lit(3),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("flag_high_lifetime_value",
-                F.when(F.col("lifetime_claimed_chf") > F.lit(200_000.0),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("flag_multi_policy_claims",
-                F.when(F.col("policies_claimed_on") > F.lit(2),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("flag_prior_fraud",
-                F.when(F.col("prior_fraud_flags") > F.lit(0),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("flag_rapid_successive",
-                F.when(
-                    (F.col("lifetime_claim_count") > F.lit(1)) &
-                    (F.col("claim_span_days") < F.lit(90)),
-                    F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("behavioural_flags_count",
-                F.col("flag_high_frequency") +
-                F.col("flag_high_lifetime_value") +
-                F.col("flag_multi_policy_claims") +
-                F.col("flag_prior_fraud") +
-                F.col("flag_rapid_successive")) \
-    .withColumn("behavioural_score",
-                F.least(F.lit(1.0),
-                        F.greatest(F.lit(0.0),
-                                   F.col("behavioural_flags_count") / F.lit(5.0))))
+    # Policies with claims per customer
+    policies_with_claims = silver_claims \
+        .groupBy("customer_id") \
+        .agg(
+            F.countDistinct("policy_id")
+                .alias("policies_with_claims")
+        )
 
-behavioural_flags = silver_claims \
-    .select("claim_id", "customer_id") \
-    .join(customer_claim_stats, on="customer_id", how="left")
+    network_sdf = silver_claims \
+        .select(
+            "claim_id", "customer_id",
+            "incident_date", "policy_id",
+            "claim_amount_chf"
+        ) \
+        .withColumn("claims_in_30d_window",
+                    F.count("claim_id").over(date_window)) \
+        .join(
+            policies_with_claims,
+            on="customer_id", how="left"
+        ) \
+        .withColumn("network_flags_count",
+                    F.when(
+                        F.col("claims_in_30d_window") >=
+                        F.lit(FRAUD_THRESHOLDS[
+                            "max_claims_per_window"
+                        ]),
+                        F.lit(1)
+                    ).otherwise(F.lit(0)) +
+                    F.when(
+                        F.col("policies_with_claims") > 2,
+                        F.lit(1)
+                    ).otherwise(F.lit(0))) \
+        .withColumn("network_score",
+                    F.round(
+                        F.least(
+                            F.col("network_flags_count") /
+                            F.lit(2.0),
+                            F.lit(1.0)
+                        ),
+                        4
+                    )) \
+        .select(
+            "claim_id",
+            "claims_in_30d_window",
+            "policies_with_claims",
+            "network_flags_count",
+            "network_score",
+        )
 
-behavioural_flags = add_fraud_audit(behavioural_flags)
-write_fraud(behavioural_flags, "fraud_behavioural_flags")
+    build_fraud_table(network_sdf, "fraud_network_scores")
 
-print("\nBehavioural flag distribution:")
-spark.sql("""
-    SELECT behavioural_flags_count,
-           COUNT(DISTINCT customer_id)     AS customer_count,
-           COUNT(claim_id)                 AS claim_count,
-           ROUND(AVG(behavioural_score),3) AS avg_behavioural_score
-    FROM insurance_fraud.fraud_behavioural_flags
-    GROUP BY behavioural_flags_count
-    ORDER BY behavioural_flags_count DESC
-""").show()
-
+except Exception as e:
+    log.error(f"Network scoring FAILED: {str(e)}")
+    log_pipeline_error(
+        spark, "fraud_network_scores", e, BATCH_ID
+    )
+    raise
 
 # COMMAND ----------
 
 
-# ─────────────────────────────────────────────
-# CELL 8 — Network Signal Scoring
-# ─────────────────────────────────────────────
 
-print(f"\n{'='*50}")
-print("RUNNING: NETWORK SIGNAL SCORING")
-print(f"{'='*50}")
+# ═══════════════════════════════════════════════════════════
+# CELL 10 — Composite Fraud Score
+# Purpose : Combine all 4 signals into one weighted score.
+#           This is the final fraud score used for decisions.
+#
+# Formula:
+#   composite_score =
+#     (rule_score        × 0.35) +
+#     (statistical_score × 0.25) +
+#     (behavioural_score × 0.25) +
+#     (network_score     × 0.15)
+#
+# Weights from src/config.py — change there not here.
+# Must sum to 1.0 — validated at config import time.
+#
+# Risk tiers:
+#   CRITICAL : score >= 0.75 — immediate investigation
+#   HIGH     : score >= 0.50 — review within 24 hours
+#   MEDIUM   : score >= 0.25 — review within 5 days
+#   LOW      : score <  0.25 — no action required
+# ═══════════════════════════════════════════════════════════
 
-policy_claim_concentration = silver_claims \
-    .groupBy("policy_id") \
-    .agg(
-        F.count("claim_id")             .alias("claims_per_policy"),
-        F.sum("claim_amount_chf")       .alias("total_claimed_per_policy"),
-        F.countDistinct("customer_id")  .alias("claimants_per_policy"),
+try:
+    rule_sdf  = spark.table(f"{FRAUD_DB}.fraud_rule_hits") \
+                     .select("claim_id", "rule_score",
+                             "rules_fired_count")
+    stat_sdf  = spark.table(
+                    f"{FRAUD_DB}.fraud_statistical_scores"
+                ).select("claim_id", "statistical_score",
+                         "z_score_amount",
+                         "is_statistical_anomaly")
+    behav_sdf = spark.table(
+                    f"{FRAUD_DB}.fraud_behavioural_flags"
+                ).select("claim_id", "behavioural_score",
+                         "lifetime_claim_count",
+                         "prior_fraud_flags",
+                         "behavioural_flags_count")
+    net_sdf   = spark.table(
+                    f"{FRAUD_DB}.fraud_network_scores"
+                ).select("claim_id", "network_score",
+                         "network_flags_count",
+                         "claims_in_30d_window")
+
+    composite = silver_claims \
+        .select(
+            "claim_id", "policy_id", "customer_id",
+            "claim_amount_chf", "claim_status",
+            "claim_type", "claim_severity",
+            "incident_date", "submitted_date",
+            "days_to_submit", "is_fraud_suspected",
+            "fraud_indicators", "handler_id"
+        ) \
+        .join(rule_sdf,  on="claim_id", how="left") \
+        .join(stat_sdf,  on="claim_id", how="left") \
+        .join(behav_sdf, on="claim_id", how="left") \
+        .join(net_sdf,   on="claim_id", how="left") \
+        .fillna(0.0, subset=[
+            "rule_score", "statistical_score",
+            "behavioural_score", "network_score"
+        ]) \
+        .withColumn("composite_score",
+                    F.round(
+                        (F.col("rule_score") *
+                         F.lit(WEIGHTS["rule_score"])) +
+                        (F.col("statistical_score") *
+                         F.lit(WEIGHTS["statistical_score"])) +
+                        (F.col("behavioural_score") *
+                         F.lit(WEIGHTS["behavioural_score"])) +
+                        (F.col("network_score") *
+                         F.lit(WEIGHTS["network_score"])),
+                        4
+                    )) \
+        .withColumn("fraud_risk_tier",
+                    F.when(
+                        F.col("composite_score") >=
+                        F.lit(FRAUD_THRESHOLDS["critical"]),
+                        F.lit("CRITICAL")
+                    ).when(
+                        F.col("composite_score") >=
+                        F.lit(FRAUD_THRESHOLDS["high"]),
+                        F.lit("HIGH")
+                    ).when(
+                        F.col("composite_score") >=
+                        F.lit(FRAUD_THRESHOLDS["medium"]),
+                        F.lit("MEDIUM")
+                    ).otherwise(F.lit("LOW"))) \
+        .withColumn("recommend_investigation",
+                    F.when(
+                        (F.col("composite_score") >=
+                         F.lit(FRAUD_THRESHOLDS["high"])) |
+                        (F.col("is_fraud_suspected") ==
+                         F.lit(True)),
+                        F.lit(True)
+                    ).otherwise(F.lit(False))) \
+        .withColumn("investigation_priority",
+                    F.when(
+                        F.col("fraud_risk_tier") == "CRITICAL",
+                        F.lit(1)
+                    ).when(
+                        F.col("fraud_risk_tier") == "HIGH",
+                        F.lit(2)
+                    ).when(
+                        F.col("fraud_risk_tier") == "MEDIUM",
+                        F.lit(3)
+                    ).otherwise(F.lit(4)))
+
+    build_fraud_table(
+        composite, "fraud_composite_scores",
+        partition_cols=["fraud_risk_tier"]
     )
 
-window_30d = Window \
-    .partitionBy("customer_id") \
-    .orderBy(F.col("incident_date").cast("long")) \
-    .rangeBetween(-30 * 86400, 0)
+except Exception as e:
+    log.error(f"Composite scoring FAILED: {str(e)}")
+    log_pipeline_error(
+        spark, "fraud_composite_scores", e, BATCH_ID
+    )
+    raise
 
-network_scores = silver_claims \
-    .join(policy_claim_concentration, on="policy_id", how="left") \
-    .withColumn("claims_in_30d_window",
-                F.count("claim_id").over(window_30d)) \
-    .withColumn("network_flag_multi_claim_policy",
-                F.when(F.col("claims_per_policy") > F.lit(2),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("network_flag_high_policy_exposure",
-                F.when(F.col("total_claimed_per_policy") > F.lit(300_000.0),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("network_flag_clustered_claims",
-                F.when(F.col("claims_in_30d_window") > F.lit(1),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("network_flag_multi_claimant",
-                F.when(F.col("claimants_per_policy") > F.lit(1),
-                       F.lit(1)).otherwise(F.lit(0))) \
-    .withColumn("network_flags_count",
-                F.col("network_flag_multi_claim_policy") +
-                F.col("network_flag_high_policy_exposure") +
-                F.col("network_flag_clustered_claims") +
-                F.col("network_flag_multi_claimant")) \
-    .withColumn("network_score",
-                F.least(F.lit(1.0),
-                        F.greatest(F.lit(0.0),
-                                   F.col("network_flags_count") / F.lit(4.0)))) \
-    .select(
-        "claim_id", "policy_id", "customer_id",
-        "claims_per_policy",
-        F.round("total_claimed_per_policy", 2).alias("total_claimed_per_policy"),
-        "claimants_per_policy",
-        "claims_in_30d_window",
-        "network_flag_multi_claim_policy",
-        "network_flag_high_policy_exposure",
-        "network_flag_clustered_claims",
-        "network_flag_multi_claimant",
-        "network_flags_count",
-        F.round("network_score", 3).alias("network_score")
+# COMMAND ----------
+
+
+
+# ═══════════════════════════════════════════════════════════
+# CELL 11 — Investigation Queue
+# Purpose : Build prioritised list for fraud analysts.
+#           Sorted by investigation_priority then score.
+#           Analysts work top-to-bottom — highest risk first.
+#
+# Reads   : insurance_fraud.fraud_composite_scores
+# Writes  : insurance_fraud.fraud_investigation_queue
+#
+# Includes:
+#   All claims recommended for investigation
+#   Full context — customer, policy, amount, signals
+#   Priority ranking for analyst workflow
+# ═══════════════════════════════════════════════════════════
+
+try:
+    composite_sdf = spark.table(
+        f"{FRAUD_DB}.fraud_composite_scores"
     )
 
-network_scores = add_fraud_audit(network_scores)
-write_fraud(network_scores, "fraud_network_scores")
+    investigation_queue = composite_sdf \
+        .filter(
+            F.col("recommend_investigation") == F.lit(True)
+        ) \
+        .join(
+            silver_customers.select(
+                "customer_id", "full_name",
+                "customer_segment", "city"
+            ),
+            on="customer_id", how="left"
+        ) \
+        .join(
+            silver_policies.select(
+                "policy_id", "policy_type",
+                "annual_premium_chf", "risk_band"
+            ),
+            on="policy_id", how="left"
+        ) \
+        .select(
+            "investigation_priority",
+            "fraud_risk_tier",
+            "composite_score",
+            "claim_id",
+            "full_name",
+            "customer_segment",
+            "policy_type",
+            "claim_type",
+            "claim_severity",
+            "claim_amount_chf",
+            "annual_premium_chf",
+            "risk_band",
+            "incident_date",
+            "days_to_submit",
+            "is_fraud_suspected",
+            "rule_score",
+            "statistical_score",
+            "behavioural_score",
+            "network_score",
+            "rules_fired_count",
+            "handler_id",
+            "city",
+        ) \
+        .orderBy(
+            "investigation_priority",
+            F.col("composite_score").desc()
+        )
 
-print("\nNetwork signal distribution:")
-spark.sql("""
-    SELECT network_flags_count,
-           COUNT(*)                        AS claim_count,
-           ROUND(AVG(network_score), 3)    AS avg_network_score
-    FROM insurance_fraud.fraud_network_scores
-    GROUP BY network_flags_count
-    ORDER BY network_flags_count DESC
-""").show()
+    build_fraud_table(
+        investigation_queue,
+        "fraud_investigation_queue",
+        partition_cols=["fraud_risk_tier"]
+    )
 
-
-# COMMAND ----------
-
-
-# ─────────────────────────────────────────────
-# CELL 9 — Composite Fraud Score
-# ─────────────────────────────────────────────
-
-print(f"\n{'='*50}")
-print("RUNNING: COMPOSITE FRAUD SCORING")
-print(f"{'='*50}")
-
-rule_sdf  = spark.table(f"{FRAUD_DB}.fraud_rule_hits") \
-                 .select("claim_id", "rule_score", "rules_fired_count")
-
-stat_sdf  = spark.table(f"{FRAUD_DB}.fraud_statistical_scores") \
-                 .select("claim_id", "statistical_score",
-                         "z_score_amount", "is_statistical_anomaly")
-
-                 
-# Remove customer_id — it already exists in silver_claims
-behav_sdf = spark.table(f"{FRAUD_DB}.fraud_behavioural_flags") \
-                 .select("claim_id", "behavioural_score",
-                         "lifetime_claim_count", "prior_fraud_flags",
-                         "behavioural_flags_count")                 
-
-net_sdf   = spark.table(f"{FRAUD_DB}.fraud_network_scores") \
-                 .select("claim_id", "network_score",
-                         "network_flags_count", "claims_in_30d_window")
-
-composite = silver_claims \
-    .select(
-        "claim_id", "policy_id", "customer_id",
-        "claim_amount_chf", "claim_status",
-        "claim_type", "claim_severity",
-        "incident_date", "submitted_date",
-        "days_to_submit", "is_fraud_suspected",
-        "fraud_indicators", "handler_id"
-    ) \
-    .join(rule_sdf,  on="claim_id", how="left") \
-    .join(stat_sdf,  on="claim_id", how="left") \
-    .join(behav_sdf, on="claim_id", how="left") \
-    .join(net_sdf,   on="claim_id", how="left") \
-    .fillna(0.0, subset=["rule_score", "statistical_score",
-                          "behavioural_score", "network_score"]) \
-    .withColumn("composite_score",
-                F.round(
-                    (F.col("rule_score")        * F.lit(WEIGHTS["rule_score"])) +
-                    (F.col("statistical_score") * F.lit(WEIGHTS["statistical_score"])) +
-                    (F.col("behavioural_score") * F.lit(WEIGHTS["behavioural_score"])) +
-                    (F.col("network_score")     * F.lit(WEIGHTS["network_score"])),
-                    4
-                )) \
-    .withColumn("fraud_risk_tier",
-                F.when(F.col("composite_score") >= F.lit(0.75), F.lit("CRITICAL"))
-                 .when(F.col("composite_score") >= F.lit(0.50), F.lit("HIGH"))
-                 .when(F.col("composite_score") >= F.lit(0.25), F.lit("MEDIUM"))
-                 .otherwise(F.lit("LOW"))) \
-    .withColumn("recommend_investigation",
-                F.when(
-                    (F.col("composite_score") >= F.lit(0.50)) |
-                    (F.col("is_fraud_suspected") == True),
-                    F.lit(True)
-                ).otherwise(F.lit(False))) \
-    .withColumn("investigation_priority",
-                F.when(F.col("fraud_risk_tier") == "CRITICAL", F.lit(1))
-                 .when(F.col("fraud_risk_tier") == "HIGH",     F.lit(2))
-                 .when(F.col("fraud_risk_tier") == "MEDIUM",   F.lit(3))
-                 .otherwise(F.lit(4)))
-
-composite = add_fraud_audit(composite)
-write_fraud(composite, "fraud_composite_scores",
-            partition_cols=["fraud_risk_tier"])
-
-print("\nComposite fraud score distribution:")
-spark.sql("""
-    SELECT fraud_risk_tier,
-           COUNT(*)                            AS claim_count,
-           ROUND(AVG(composite_score), 4)      AS avg_composite_score,
-           ROUND(AVG(claim_amount_chf), 2)     AS avg_claim_chf,
-           ROUND(SUM(claim_amount_chf), 0)     AS total_exposure_chf,
-           SUM(CASE WHEN is_fraud_suspected
-                    THEN 1 ELSE 0 END)         AS confirmed_suspected
-    FROM insurance_fraud.fraud_composite_scores
-    GROUP BY fraud_risk_tier
-    ORDER BY avg_composite_score DESC
-""").show()
+except Exception as e:
+    log.error(f"Investigation queue FAILED: {str(e)}")
+    log_pipeline_error(
+        spark, "fraud_investigation_queue", e, BATCH_ID
+    )
+    raise
 
 
 # COMMAND ----------
 
 
+# ═══════════════════════════════════════════════════════════
+# CELL 12 — Fraud Layer Validation Report
+# Purpose : Post-scoring checks.
+#           Verifies all Fraud tables built correctly.
+#           Reviews score distribution for sanity.
+#           Checks pipeline errors.
+# ═══════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────
-# CELL 10 — Investigation Queue
-# ─────────────────────────────────────────────
-
-print(f"\n{'='*50}")
-print("BUILDING: INVESTIGATION QUEUE")
-print(f"{'='*50}")
-
-investigation_queue = spark.table(f"{FRAUD_DB}.fraud_composite_scores") \
-    .filter(F.col("recommend_investigation") == True) \
-    .join(
-        silver_customers.select(
-            "customer_id", "full_name", "email",
-            "customer_segment", "customer_tenure_years",
-            "city", "country"
-        ),
-        on="customer_id",
-        how="left"
-    ) \
-    .join(
-        silver_policies.select(
-            "policy_id", "policy_type", "status",
-            "annual_premium_chf", "coverage_amount_chf",
-            "risk_band"
-        ),
-        on="policy_id",
-        how="left"
-    ) \
-    .select(
-        "investigation_priority",
-        "fraud_risk_tier",
-        "claim_id",
-        F.round("claim_amount_chf",   2).alias("claim_amount_chf"),
-        F.round("composite_score",    4).alias("composite_score"),
-        F.round("rule_score",         3).alias("rule_score"),
-        F.round("statistical_score",  3).alias("statistical_score"),
-        F.round("behavioural_score",  3).alias("behavioural_score"),
-        F.round("network_score",      3).alias("network_score"),
-        "rules_fired_count",
-        "z_score_amount",
-        "behavioural_flags_count",
-        "network_flags_count",
-        "claims_in_30d_window",
-        "lifetime_claim_count",
-        "prior_fraud_flags",
-        "is_fraud_suspected",
-        "fraud_indicators",
-        "claim_type",
-        "claim_severity",
-        "incident_date",
-        "submitted_date",
-        "days_to_submit",
-        "handler_id",
-        "full_name",
-        "email",
-        "customer_segment",
-        "customer_tenure_years",
-        "city",
-        "policy_type",
-        F.round("annual_premium_chf",  2).alias("annual_premium_chf"),
-        F.round("coverage_amount_chf", 2).alias("coverage_amount_chf"),
-        "risk_band",
-        "_fraud_batch_id",
-        "_fraud_load_timestamp"
-    ) \
-    .orderBy("investigation_priority", F.col("composite_score").desc())
-
-write_fraud(investigation_queue, "fraud_investigation_queue",
-            partition_cols=["fraud_risk_tier"])
-
-print("\nInvestigation queue summary:")
-spark.sql("""
-    SELECT fraud_risk_tier,
-           COUNT(*)                            AS cases_in_queue,
-           ROUND(AVG(composite_score), 4)      AS avg_score,
-           ROUND(SUM(claim_amount_chf), 0)     AS total_exposure_chf,
-           ROUND(AVG(claim_amount_chf), 0)     AS avg_claim_chf
-    FROM insurance_fraud.fraud_investigation_queue
-    GROUP BY fraud_risk_tier
-    ORDER BY avg_score DESC
-""").show()
-
-print("\nTop 10 priority cases:")
-spark.sql("""
-    SELECT claim_id,
-           full_name,
-           fraud_risk_tier,
-           ROUND(composite_score, 4)       AS composite_score,
-           ROUND(claim_amount_chf, 0)      AS claim_chf,
-           claim_type,
-           rules_fired_count,
-           prior_fraud_flags,
-           claims_in_30d_window
-    FROM insurance_fraud.fraud_investigation_queue
-    ORDER BY investigation_priority,
-             composite_score DESC
-    LIMIT 10
-""").show(truncate=False)
-
-
-# COMMAND ----------
-
-
-# ─────────────────────────────────────────────
-# CELL 11 — Final Fraud Validation Report
-# ─────────────────────────────────────────────
-
-print(f"\n{'='*50}")
-print("FRAUD DETECTION — FINAL VALIDATION REPORT")
-print(f"{'='*50}")
+print(f"\n{'='*60}")
+print("FRAUD LAYER — VALIDATION REPORT")
+print(f"{'='*60}")
 
 fraud_tables = [
     "fraud_rule_hits",
@@ -648,31 +817,92 @@ fraud_tables = [
 ]
 
 total = 0
+print("\n FRAUD TABLES:")
 for table in fraud_tables:
-    count = spark.table(f"{FRAUD_DB}.{table}").count()
-    total += count
-    print(f"  {table:<35} {count:>8,} rows ✅")
+    try:
+        count = spark.table(f"{FRAUD_DB}.{table}").count()
+        total += count
+        print(f"  {table:<30} {count:>8,} rows ✅")
+    except Exception as e:
+        print(f"  {table:<30} ERROR ❌")
 
-print(f"\n  {'TOTAL':<35} {total:>8,} rows")
+print(f"\n  {'TOTAL':<30} {total:>8,} rows")
 
-print(f"\n  KEY FRAUD KPIs")
-print(f"  {'─'*45}")
-spark.sql("""
-    SELECT
-        COUNT(*)                                        AS total_claims_scored,
-        SUM(CASE WHEN fraud_risk_tier = 'CRITICAL'
-                 THEN 1 ELSE 0 END)                    AS critical_tier,
-        SUM(CASE WHEN fraud_risk_tier = 'HIGH'
-                 THEN 1 ELSE 0 END)                    AS high_tier,
-        SUM(CASE WHEN recommend_investigation = true
-                 THEN 1 ELSE 0 END)                    AS flagged_for_investigation,
-        ROUND(SUM(CASE WHEN recommend_investigation = true
-                       THEN claim_amount_chf
-                       ELSE 0 END), 0)                 AS total_exposure_chf,
-        ROUND(AVG(composite_score), 4)                 AS avg_composite_score
-    FROM insurance_fraud.fraud_composite_scores
+# ── Score distribution ───────────────────────────────────
+print("\n COMPOSITE SCORE DISTRIBUTION:")
+spark.sql(f"""
+    SELECT fraud_risk_tier,
+           COUNT(*)                           AS claim_count,
+           ROUND(AVG(composite_score), 4)     AS avg_score,
+           ROUND(MIN(composite_score), 4)     AS min_score,
+           ROUND(MAX(composite_score), 4)     AS max_score,
+           SUM(CASE WHEN is_fraud_suspected
+                    THEN 1 ELSE 0 END)        AS confirmed_suspected
+    FROM {FRAUD_DB}.fraud_composite_scores
+    GROUP BY fraud_risk_tier
+    ORDER BY avg_score DESC
 """).show()
 
-print(f"  Batch ID: {BATCH_ID}")
-print(f"{'='*50}")
-print(f"\n✅ Fraud detection complete — Batch ID: {BATCH_ID}")
+# ── Pipeline errors ──────────────────────────────────────
+error_count = spark.table(
+    f"{DATABASES['bronze']}.pipeline_errors"
+).filter(F.col("batch_id") == BATCH_ID).count()
+
+status = "✅ SUCCESS" if error_count == 0 else "❌ FAILED"
+print(f"\n{'='*60}")
+print(f"  Batch ID : {BATCH_ID}")
+print(f"  Status   : {status}")
+print(f"  Errors   : {error_count}")
+print(f"{'='*60}")
+
+if error_count > 0:
+    raise RuntimeError(
+        f"Fraud pipeline failed with {error_count} error(s)."
+    )
+
+
+# COMMAND ----------
+
+
+# ═══════════════════════════════════════════════════════════
+# CELL 13 — Investigation Queue Preview
+# Purpose : Show top priority claims for investigation.
+#           This is what a fraud analyst sees first.
+# ═══════════════════════════════════════════════════════════
+
+print("\nTop 10 Priority Claims for Investigation:")
+spark.sql(f"""
+    SELECT investigation_priority,
+           fraud_risk_tier,
+           ROUND(composite_score, 4)  AS score,
+           claim_id,
+           full_name,
+           policy_type,
+           claim_type,
+           ROUND(claim_amount_chf, 0) AS claim_amount,
+           rule_score,
+           statistical_score,
+           behavioural_score,
+           network_score
+    FROM {FRAUD_DB}.fraud_investigation_queue
+    ORDER BY investigation_priority,
+             composite_score DESC
+    LIMIT 10
+""").show(truncate=False)
+
+print("\nFraud signal type breakdown:")
+spark.sql(f"""
+    SELECT signal_type,
+           COUNT(*)                       AS total_signals,
+           ROUND(AVG(signal_score), 3)    AS avg_score,
+           SUM(CASE WHEN is_confirmed_fraud
+                    THEN 1 ELSE 0 END)    AS confirmed_fraud
+    FROM {SILVER_DB}.fraud_signals
+    GROUP BY signal_type
+    ORDER BY total_signals DESC
+""").show(truncate=False)
+
+# Uncache claims now that all scoring is complete
+silver_claims.unpersist()
+
+print(f"\n✅ Fraud layer complete — Batch ID: {BATCH_ID}")
