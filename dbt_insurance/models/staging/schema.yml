@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: stg_claims
+    description: "Staged claims KPI data from Gold layer"
+    columns:
+      - name: policy_type
+        description: "Type of insurance policy"
+        tests:
+          - not_null
+      - name: claim_type
+        description: "Type of claim"
+        tests:
+          - not_null
+      - name: loss_ratio
+        description: "Loss ratio percentage"
+        tests:
+          - not_null
+      - name: total_claims
+        description: "Total number of claims"
+        tests:
+          - not_null
+
+  - name: stg_fraud
+    description: "Staged fraud summary data from Gold layer"
+    columns:
+      - name: signal_type
+        description: "Type of fraud signal"
+        tests:
+          - not_null
+      - name: score_band
+        description: "Fraud score band"
+        tests:
+          - not_null
+      - name: total_signals
+        description: "Total fraud signals detected"
+        tests:
+          - not_null

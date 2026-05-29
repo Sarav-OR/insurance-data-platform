@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: mart_claims_summary
+    description: "Claims performance KPIs for business reporting"
+    columns:
+      - name: policy_type
+        tests:
+          - not_null
+      - name: claim_type
+        tests:
+          - not_null
+      - name: total_claims
+        tests:
+          - not_null
+      - name: avg_loss_ratio
+        tests:
+          - not_null
+
+  - name: mart_fraud_summary
+    description: "Fraud analytics KPIs for investigation reporting"
+    columns:
+      - name: signal_type
+        tests:
+          - not_null
+      - name: total_fraud_exposure_chf
+        tests:
+          - not_null
